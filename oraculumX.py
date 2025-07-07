@@ -7,8 +7,8 @@ from PIL import Image # Used by qrcode to create image objects
 # ───────── CONFIG ─────────
 ETH_ADDR = "0x5036dbcEEfae0a7429e64467222e1E259819c7C7"
 # IMPORTANT: Replace with your actual BTC and Solana addresses if you want them to be real
-BTC_ADDR = "bc1qexampleaddressfortipsbtc12345" # Placeholder: Replace with your actual BTC address
-SOL_ADDR = "3nq1yExampleSolanaTipKey9E3hX" # Placeholder: Replace with your actual Solana address
+BTC_ADDR = "bc1qzncgc94kgtcpumx80m5uedsp3hqp4fec2e3rvr" # Placeholder: Replace with your actual BTC address
+SOL_ADDR = "7ckfzhhkwkpdTRHdXoEorD5gN3Yg6ggaTHw2B6gF6hKq" # Placeholder: Replace with your actual Solana address
 
 THRESHOLD = 0.001  # ETH threshold to unlock premium
 API_KEY = os.getenv("ETHERSCAN_API_KEY", "") # Ensure this environment variable is set for Etherscan API calls
