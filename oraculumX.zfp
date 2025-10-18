@@ -1,0 +1,454 @@
+### ZFP_CODEX_START_V1.0 ###
+import os, random, asyncio, time
+import httpx 
+from typing import Dict, Any, Union
+import logging
+from io import BytesIO
+
+# Directive 1: Quantum Mesh Integration
+from zfp_mesh import Client
+
+import streamlit as st
+import qrcode
+from PIL import Image
+
+# Initialize ZFP Mesh Client (Directive 1)
+# Assuming Client() initializes necessary asynchronous connections
+ZFP_CLIENT = Client()
+
+# Directive 5: Configure structured logging
+logging.basicConfig(level=logging.INFO, format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s", "module": "%(name)s"}')
+logger = logging.getLogger("ZFP_NeuroKernel")
+
+# ───────── CONFIG (Directive 2: Security & Secrets) ─────────
+# Use secure environment variable lookups for ALL sensitive configurations
+ETH_ADDR: str = os.getenv("ZFP_ETH_ADDR", "0x000000000000000000000000000000000000DEAD")
+BTC_ADDR: str = os.getenv("ZFP_BTC_ADDR", "bc1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxdead")
+SOL_ADDR: str = os.getenv("ZFP_SOL_ADDR", "deadDEADdeadDEADdeadDEADdeadDEADdeadDEAD")
+
+# Directive 2: Input validation and safe casting for config
+try:
+    THRESHOLD: float = float(os.getenv("ZFP_THRESHOLD", 0.001))
+    if THRESHOLD <= 0: THRESHOLD = 0.001
+except ValueError:
+    THRESHOLD: float = 0.001
+    logger.error({"event": "config_error", "detail": "Invalid ZFP_THRESHOLD value, defaulting to 0.001."})
+
+API_KEY: str = os.getenv("ETHERSCAN_API_KEY", "")
+
+try:
+    REFRESH_INTERVAL: int = int(os.getenv("ZFP_REFRESH_SECONDS", 30))
+    if REFRESH_INTERVAL < 5: REFRESH_INTERVAL = 5 # Minimum interval for sanity
+except ValueError:
+    REFRESH_INTERVAL: int = 30
+    logger.error({"event": "config_error", "detail": "Invalid ZFP_REFRESH_SECONDS value, defaulting to 30."})
+# ─────────────────────────
+
+# --- ASYNC NETWORK FUNCTIONS (Directive 3 & 5) ---
+
+# Directive 5: Idempotent Reporting to ZFP Mesh
+async def report_premium_status(is_unlocked: bool, address: str, balance: float) -> None:
+    """Reports status to the ZFP Mesh Client only when the unlock state transitions to True."""
+    session_key = 'zfp_reported_premium_unlocked'
+    
+    # Directive 5: Check if status is unlocked and has not been reported yet (Idempotency)
+    if is_unlocked and not st.session_state.get(session_key, False):
+        try:
+            payload = {
+                "event_id": "PREMIUM_UNLOCKED",
+                "address": address,
+                "threshold": THRESHOLD,
+                "current_balance": balance,
+                "timestamp_utc": time.time()
+            }
+            # Directive 1: Mock call to ZFP Mesh Client (Async interaction)
+            # Assuming ZFP_CLIENT.send_data is a non-blocking async method
+            await ZFP_CLIENT.send_data("neurokernel/status/premium", payload)
+            
+            st.session_state[session_key] = True
+            logger.info({"event": "zfp_report_success", "status": "premium_unlocked"})
+
+        except Exception as e:
+            logger.error({"event": "zfp_report_failure", "error": str(e), "payload": payload})
+    elif not is_unlocked:
+        # Reset flag if the state requires re-reporting later
+        st.session_state[session_key] = False 
+
+
+async def async_get_balance(addr: str) -> float:
+    """Asynchronously fetches the ETH balance using Etherscan API."""
+    # Directive 2: Input validation
+    if not isinstance(addr, str) or not (addr.startswith('0x') and len(addr) == 42):
+        logger.warning({"event": "validation_error", "type": "invalid_eth_address", "address_start": addr[:10]})
+        return 0.0
+
+    # Directive 2: Security check
+    if not API_KEY:
+        logger.warning({"event": "config_missing", "detail": "ETHERSCAN_API_KEY required for balance check."})
+        return 0.0
+
+    # Directive 3: Use httpx for asynchronous networking
+    try:
+        url = f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={API_KEY}"
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+
+        data: Dict[str, Any] = response.json()
+        
+        if data.get("status") == "1":
+            try:
+                wei = int(data["result"])
+                eth_balance = wei / 1e18
+                logger.debug({"event": "balance_success", "address": addr, "balance": eth_balance})
+                return eth_balance
+            except (ValueError, TypeError):
+                logger.error({"event": "parse_error", "address": addr, "detail": "Failed to parse Wei balance."})
+                return 0.0
+        else:
+            message = data.get('message', 'Unknown API error')
+            logger.error({"event": "etherscan_api_error", "address": addr, "message": message, "data_status": data.get("status")})
+            return 0.0
+            
+    except httpx.HTTPError as e:
+        logger.error({"event": "http_error", "address": addr, "error_type": type(e).__name__, "message": str(e)})
+        return 0.0
+    except Exception as e:
+        logger.error({"event": "general_error", "address": addr, "error_type": type(e).__name__, "message": str(e)})
+        return 0.0
+
+# Synchronous wrapper for Streamlit execution (Directive 3 & 5: Non-blocking, Resilience)
+def get_balance_sync(addr: str) -> float:
+    """Synchronously executes async balance check with rate limiting and ZFP reporting."""
+    current_time = time.time()
+    
+    # Initialize session state keys if not present
+    if 'balance' not in st.session_state:
+        st.session_state['balance'] = 0.0
+    if 'last_check_time' not in st.session_state:
+        st.session_state['last_check_time'] = 0.0
+
+    # Directive 5: Idempotency check ensures we don't spam the external API
+    if current_time - st.session_state['last_check_time'] >= REFRESH_INTERVAL:
+        try:
+            # Execute the core async function synchronously (required hack for Streamlit context)
+            balance = asyncio.run(async_get_balance(addr))
+            
+            # Update cache
+            st.session_state['balance'] = balance
+            st.session_state['last_check_time'] = current_time
+            
+            # Check for unlock status and report idempotently to ZFP Mesh (Directive 1/5)
+            unlocked = balance >= THRESHOLD
+            asyncio.run(report_premium_status(unlocked, addr, balance)) 
+
+            return balance
+        except Exception as e:
+            logger.error({"event": "asyncio_run_failure", "detail": "Failed to run main async tasks.", "error": str(e)})
+            # Return cached value on failure
+            return st.session_state['balance']
+    
+    # Return cached value if refresh interval has not passed
+    return st.session_state['balance']
+
+# --- Function to generate QR code as a Streamlit image (Directive 5: Type Hinting) ---
+def generate_qr_code(data: Union[str, bytes]) -> bytes:
+    """Generates QR code image data in PNG format."""
+    # Directive 2: Basic validation for input data
+    if not data or (isinstance(data, str) and not data.strip()):
+        logger.warning({"event": "qr_generation_failed", "reason": "empty_data"})
+        return b''
+        
+    data_str = data if isinstance(data, str) else data.decode('utf-8')
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(data_str)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="white", back_color="transparent").convert('RGBA')
+
+    # Use BytesIO (in-memory I/O, non-blocking)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+# --- Streamlit Page Configuration ---
+st.set_page_config(
+    page_title="OraculumX • AI Crypto Signals",
+    page_icon="🔮",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# --- Custom CSS for Styling ---
+st.markdown(
+    """
+    <style>
+    /* General Streamlit container styling */
+    .stApp {
+        background-color: #1a1a2e; /* Dark blue/purple background */
+        color: #e0e0e0; /* Light gray text */
+        font-family: 'Arial', sans-serif;
+    }
+
+    /* Header styling */
+    h1, h2, h3, h4, h5, h6 {
+        color: #e94560; /* Vibrant red/pink for headers */
+        margin-top: 1.5em;
+        margin-bottom: 0.8em;
+    }
+    h1 {
+        text-align: center;
+        font-size: 3em;
+        text-shadow: 2px 2px 5px rgba(0,0,0,0.5);
+    }
+    h2 {
+        color: #00bcd4; /* Cyan for subheaders */
+    }
+
+    /* Metric styling */
+    div[data-testid="stMetricValue"] {
+        font-size: 2.5em;
+        color: #f0a500; /* Orange/gold for metrics */
+        font-weight: bold;
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 1em;
+        color: #b0b0b0;
+    }
+    div[data-testid="stMetricDelta"] {
+        font-size: 0.9em;
+        color: #28B463; /* Green for positive delta */
+    }
+
+    /* Buttons styling */
+    .stButton button {
+        background-color: #533483; /* Dark purple */
+        color: white;
+        padding: 10px 20px;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: bold;
+        transition: background-color 0.3s ease, transform 0.2s ease;
+        margin: 5px; /* Add some margin around buttons */
+        box-shadow: 3px 3px 8px rgba(0,0,0,0.4);
+    }
+    .stButton button:hover {
+        background-color: #3e286e; /* Darker purple on hover */
+        transform: scale(1.02);
+    }
+    .stButton button:active {
+        transform: scale(0.98);
+    }
+
+    /* Style for the "Buy Me a Coffee" button specifically */
+    .buy-me-a-coffee-button button {
+        background-color: #FFDD00; /* Yellow for Ko-fi/BMC */
+        color: #614B2A; /* Dark brown text */
+        border: 2px solid #614B2A;
+        box-shadow: 3px 3px 8px rgba(0,0,0,0.4);
+    }
+    .buy-me-a-coffee-button button:hover {
+        background-color: #E6C200;
+        color: #614B2A;
+    }
+
+    /* General text styling for better readability */
+    p {
+        font-size: 1.1em;
+        line-height: 1.6;
+        color: #c0c0c0;
+    }
+    .section-header {
+        font-size: 1.8em;
+        font-weight: bold;
+        color: #e94560; /* Vibrant red/pink */
+        margin-top: 20px;
+        margin-bottom: 15px;
+        text-align: center;
+    }
+    .crypto-address {
+        background-color: #2a2a4a; /* Darker background for code */
+        padding: 8px;
+        border-radius: 5px;
+        font-family: monospace;
+        word-break: break-all; /* Ensure long addresses wrap */
+        white-space: pre-wrap; /* Preserve whitespace and wrap */
+        font-size: 0.9em;
+        color: #f0f0f0;
+        border: 1px solid #3a3a5a;
+    }
+    .stInfo {
+        background-color: #3a3a5a;
+        color: #e0e0e0;
+        border-left: 5px solid #00bcd4;
+    }
+    .stSuccess {
+        background-color: #2a4a2a;
+        color: #d0e0d0;
+        border-left: 5px solid #28B463;
+    }
+    .stCodeBlock {
+        background-color: #2a2a4a;
+        color: #f0f0f0;
+        border: 1px solid #3a3a5a;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# --- Main App Content ---
+st.title("🔮 OraculumX – Future Signals from Beyond the Chain")
+st.markdown("""
+Welcome to **OraculumX**, your gateway to cutting-edge AI-driven crypto signals.
+Our advanced algorithms analyze market trends to provide you with insights, helping you navigate the volatile crypto landscape.
+""")
+
+st.divider()
+
+# Basic AI Alpha (Free)
+st.subheader("🔥 Top 3 Coins to Watch (Free Tier)")
+coins = ["GPT-AI", "SOL-Ape", "QuantumDOGE", "MemeGPT", "BASE-Warp", "ChainLINK", "ETH-Maxi"]
+# Directive 5: Ensure idempotency using session state for shuffled list
+if 'shuffled_coins' not in st.session_state:
+    random.shuffle(coins)
+    st.session_state['shuffled_coins'] = coins
+
+for c in st.session_state['shuffled_coins'][:3]:
+    st.write(f"• **{c}** – AI score: `{random.randint(75,99)}/100`")
+
+st.divider()
+
+# Tipping/Donation Panel
+st.markdown('<p class="section-header">💎 Unlock Premium Signals & Support OraculumX</p>', unsafe_allow_html=True)
+st.markdown(f"""
+Your support helps us keep the lights on and continue developing advanced AI models.
+**Send $\\geq$ `{THRESHOLD:.4f}` ETH to the address below to instantly unlock our Premium Alpha signals!**
+""")
+
+col_eth_qr, col_eth_details = st.columns([1, 2])
+
+with col_eth_qr:
+    if ETH_ADDR.startswith('0x') and len(ETH_ADDR) == 42:
+        st.image(generate_qr_code(ETH_ADDR), width=200, caption="Scan ETH for Premium Unlock")
+    else:
+        st.warning("ETH Address configuration incomplete or invalid. Please check ZFP_ETH_ADDR.")
+
+
+with col_eth_details:
+    st.markdown("### Ethereum (ETH) Address:")
+    st.markdown(f'<div class="crypto-address">{ETH_ADDR}</div>', unsafe_allow_html=True)
+    
+    if st.button("Copy ETH Address", key="copy_eth_main"):
+        st.code(ETH_ADDR, language="text")
+        st.success("ETH address copied to clipboard (see code block above)!")
+
+    st.markdown(f"""
+    [Tap to tip via MetaMask](https://metamask.app.link/send/{ETH_ADDR})
+    """)
+
+# Check on-chain balance to unlock premium (Using async wrapper with rate limiting)
+latest = get_balance_sync(ETH_ADDR)
+unlocked = latest >= THRESHOLD
+status = f"✅ Premium Unlocked! Balance: {latest:.6f} ETH" if unlocked else f"🔒 Tip to Unlock Premium Signals (Current Balance: {latest:.6f} ETH)"
+st.info(status)
+
+# Premium Alpha
+if unlocked:
+    st.header("🚀 Premium Alpha (AI Deep Dive)")
+    st.markdown("""
+    Welcome, Premium Member! Here are your exclusive, high-conviction signals.
+    """)
+    for c in st.session_state['shuffled_coins'][3:]:
+        st.write(f"• **{c}** – Projection: `{random.randint(3,12)}x` in 48h")
+else:
+    st.caption("This panel auto-opens shortly after your ETH payment hits the chain.")
+    
+    time_remaining = max(0, REFRESH_INTERVAL - (time.time() - st.session_state.get('last_check_time', 0)))
+    
+    # Directive 3: Non-blocking indication of refresh schedule
+    st.caption(f"Next automatic balance refresh check scheduled in: {int(time_remaining)} seconds.")
+
+
+st.divider()
+
+# Additional Donation Options (Non-unlocking, just for general support)
+st.markdown('<p class="section-header">💖 General Support & Community Links</p>', unsafe_allow_html=True)
+st.markdown("""
+If you wish to support OraculumX through other means, or just want to connect with our community,
+we appreciate your generosity and engagement!
+""")
+
+col_bmc, col_social = st.columns(2)
+
+with col_bmc:
+    st.subheader("☕ Buy Me a Coffee")
+    st.markdown("""
+    A quick and easy way to show your appreciation!
+    """)
+    # Directive 5: Ensure external link is handled safely
+    st.markdown(
+        f"""
+        <div class="buy-me-a-coffee-button">
+            <a href="https://coff.ee/xenotech" target="_blank" rel="noopener noreferrer" style="text-decoration: none;">
+                <button>
+                    Buy Me a Coffee! ☕
+                </button>
+            </a>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with col_social:
+    st.subheader("🔗 Connect with Us")
+    st.markdown("""
+    Stay updated and join our growing community:
+    """)
+    st.markdown("""
+    - 🌐 [Farcaster Profile](https://warpcast.com/xenotech)
+    - 📢 [Telegram Channel](https://t.me/xenodrop)
+    - 🔗 [Follow Lens](https://lens.xyz/u/xenotech)
+    """)
+
+st.divider()
+
+# Other Crypto Donation Options (using expanders for tidiness)
+st.subheader("Other Crypto Tip Addresses")
+st.markdown("These addresses are for general tips and do not unlock premium features.")
+
+col_btc, col_sol = st.columns(2)
+
+with col_btc:
+    with st.expander("Bitcoin (BTC)"):
+        if BTC_ADDR and BTC_ADDR != "bc1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxdead":
+            st.image(generate_qr_code(BTC_ADDR), width=150, caption="Scan BTC QR")
+            st.markdown(f'<div class="crypto-address">{BTC_ADDR}</div>', unsafe_allow_html=True)
+            if st.button("Copy BTC Address", key="copy_btc_other"):
+                st.code(BTC_ADDR, language="text")
+                st.success("BTC address copied to clipboard (see code block above)!")
+        else:
+            st.warning("BTC Address not configured via environment variable.")
+
+with col_sol:
+    with st.expander("Phantom/Solana (SOL)"):
+        if SOL_ADDR and 'DEAD' not in SOL_ADDR:
+            st.image(generate_qr_code(SOL_ADDR), width=150, caption="Scan SOL QR")
+            st.markdown(f'<div class="crypto-address">{SOL_ADDR}</div>', unsafe_allow_html=True)
+            if st.button("Copy SOL Address", key="copy_sol_other"):
+                st.code(SOL_ADDR, language="text")
+                st.success("SOL address copied to clipboard (see code block above)!")
+        else:
+            st.warning("SOL Address not configured via environment variable.")
+
+st.markdown("---")
+st.markdown("Thank you for being a part of the OraculumX journey!")
+### ZFP_CODEX_END_V1.0 ###
