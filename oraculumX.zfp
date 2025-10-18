@@ -1,204 +1,188 @@
 ### ZFP_CODEX_START_V1.0 ###
-import os, random, asyncio, time
-import httpx 
-from typing import Dict, Any, Union
+import os
+import random
+import asyncio
+import time
+import httpx
+from typing import Dict, Any, Union, Callable
 import logging
 from io import BytesIO
 
-# Directive 1: Quantum Mesh Integration
+# Directive 1: Quantum Mesh Integration (Mock Client)
+# Note: For production, this client handles secure routing and mesh service discovery.
 from zfp_mesh import Client
 
 import streamlit as st
 import qrcode
 from PIL import Image
 
-# Initialize ZFP Mesh Client (Directive 1)
-# Assuming Client() initializes necessary asynchronous connections
-ZFP_CLIENT = Client()
-
 # Directive 5: Configure structured logging
-logging.basicConfig(level=logging.INFO, format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s", "module": "%(name)s"}')
+logging.basicConfig(level=logging.INFO, format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}')
 logger = logging.getLogger("ZFP_NeuroKernel")
 
+# Instantiate ZFP Mesh Client (Directive 1)
+try:
+    zfp_client = Client()
+    logger.info({"event": "zfp_mesh_init", "status": "ok"})
+except Exception as e:
+    logger.critical({"event": "zfp_mesh_failure", "error": str(e)})
+
 # ───────── CONFIG (Directive 2: Security & Secrets) ─────────
-# Use secure environment variable lookups for ALL sensitive configurations
+# Use secure placeholders for public addresses if environment variables are missing
 ETH_ADDR: str = os.getenv("ZFP_ETH_ADDR", "0x000000000000000000000000000000000000DEAD")
 BTC_ADDR: str = os.getenv("ZFP_BTC_ADDR", "bc1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxdead")
 SOL_ADDR: str = os.getenv("ZFP_SOL_ADDR", "deadDEADdeadDEADdeadDEADdeadDEADdeadDEAD")
 
-# Directive 2: Input validation and safe casting for config
+# Directive 2: API Key MUST be set via environment variable for security
+API_KEY: str = os.getenv("ETHERSCAN_API_KEY", "")
+
 try:
     THRESHOLD: float = float(os.getenv("ZFP_THRESHOLD", 0.001))
-    if THRESHOLD <= 0: THRESHOLD = 0.001
 except ValueError:
     THRESHOLD: float = 0.001
     logger.error({"event": "config_error", "detail": "Invalid ZFP_THRESHOLD value, defaulting to 0.001."})
 
-API_KEY: str = os.getenv("ETHERSCAN_API_KEY", "")
-
 try:
     REFRESH_INTERVAL: int = int(os.getenv("ZFP_REFRESH_SECONDS", 30))
-    if REFRESH_INTERVAL < 5: REFRESH_INTERVAL = 5 # Minimum interval for sanity
+    if REFRESH_INTERVAL < 10: REFRESH_INTERVAL = 10 # Enforce minimum interval
 except ValueError:
     REFRESH_INTERVAL: int = 30
     logger.error({"event": "config_error", "detail": "Invalid ZFP_REFRESH_SECONDS value, defaulting to 30."})
 # ─────────────────────────
 
-# --- ASYNC NETWORK FUNCTIONS (Directive 3 & 5) ---
+# --- ASYNC NETWORK FUNCTIONS (Directive 3: Performance, Directive 5: Resilience/Type Hinting) ---
 
-# Directive 5: Idempotent Reporting to ZFP Mesh
-async def report_premium_status(is_unlocked: bool, address: str, balance: float) -> None:
-    """Reports status to the ZFP Mesh Client only when the unlock state transitions to True."""
-    session_key = 'zfp_reported_premium_unlocked'
-    
-    # Directive 5: Check if status is unlocked and has not been reported yet (Idempotency)
-    if is_unlocked and not st.session_state.get(session_key, False):
-        try:
-            payload = {
-                "event_id": "PREMIUM_UNLOCKED",
-                "address": address,
-                "threshold": THRESHOLD,
-                "current_balance": balance,
-                "timestamp_utc": time.time()
-            }
-            # Directive 1: Mock call to ZFP Mesh Client (Async interaction)
-            # Assuming ZFP_CLIENT.send_data is a non-blocking async method
-            await ZFP_CLIENT.send_data("neurokernel/status/premium", payload)
-            
-            st.session_state[session_key] = True
-            logger.info({"event": "zfp_report_success", "status": "premium_unlocked"})
-
-        except Exception as e:
-            logger.error({"event": "zfp_report_failure", "error": str(e), "payload": payload})
-    elif not is_unlocked:
-        # Reset flag if the state requires re-reporting later
-        st.session_state[session_key] = False 
-
-
-async def async_get_balance(addr: str) -> float:
-    """Asynchronously fetches the ETH balance using Etherscan API."""
+async def async_get_balance(addr: str, api_key: str) -> float:
+    """
+    Asynchronously retrieves the Ethereum balance for a given address using Etherscan.
+    Implements robust validation and error handling.
+    """
     # Directive 2: Input validation
     if not isinstance(addr, str) or not (addr.startswith('0x') and len(addr) == 42):
         logger.warning({"event": "validation_error", "type": "invalid_eth_address", "address_start": addr[:10]})
         return 0.0
 
-    # Directive 2: Security check
-    if not API_KEY:
-        logger.warning({"event": "config_missing", "detail": "ETHERSCAN_API_KEY required for balance check."})
+    if not api_key:
+        logger.error({"event": "config_missing", "detail": "ETHERSCAN_API_KEY is required and missing."})
         return 0.0
 
-    # Directive 3: Use httpx for asynchronous networking
+    # Directive 1: Log intent to use ZFP routing for external connection
+    logger.debug({"event": "zfp_routing", "target": "etherscan_api"})
+
     try:
-        url = f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={API_KEY}"
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        url = f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest&apikey={api_key}"
+
+        # Directive 3: Use asynchronous HTTP client
+        async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(url)
             response.raise_for_status()
 
         data: Dict[str, Any] = response.json()
-        
+
         if data.get("status") == "1":
             try:
                 wei = int(data["result"])
                 eth_balance = wei / 1e18
-                logger.debug({"event": "balance_success", "address": addr, "balance": eth_balance})
+                logger.info({"event": "balance_success", "address": addr, "balance": eth_balance})
                 return eth_balance
-            except (ValueError, TypeError):
-                logger.error({"event": "parse_error", "address": addr, "detail": "Failed to parse Wei balance."})
+            except (ValueError, KeyError):
+                logger.error({"event": "parse_error", "address": addr, "detail": "Failed to parse Wei balance from API result."})
                 return 0.0
         else:
             message = data.get('message', 'Unknown API error')
-            logger.error({"event": "etherscan_api_error", "address": addr, "message": message, "data_status": data.get("status")})
+            logger.error({"event": "etherscan_api_error", "address": addr, "status": data.get("status"), "message": message})
             return 0.0
-            
+
     except httpx.HTTPError as e:
-        logger.error({"event": "http_error", "address": addr, "error_type": type(e).__name__, "message": str(e)})
-        return 0.0
+        logger.error({"event": "http_error", "address": addr, "error_type": type(e).__name__, "message": str(e), "context": "Etherscan API call failed"})
+        return st.session_state.get('balance', 0.0) # Resilience: return cached value on network failure
     except Exception as e:
         logger.error({"event": "general_error", "address": addr, "error_type": type(e).__name__, "message": str(e)})
-        return 0.0
+        return st.session_state.get('balance', 0.0)
 
-# Synchronous wrapper for Streamlit execution (Directive 3 & 5: Non-blocking, Resilience)
-def get_balance_sync(addr: str) -> float:
-    """Synchronously executes async balance check with rate limiting and ZFP reporting."""
+# Synchronous wrapper for Streamlit execution (Directive 3 & 5: Non-blocking via caching, Resilience)
+def get_balance_sync(addr: str, api_key: str, refresh_interval: int) -> float:
+    """
+    Synchronous wrapper utilizing asyncio.run() and enforcing rate limits 
+    via Streamlit session state (Directive 5: Idempotency).
+    """
     current_time = time.time()
-    
-    # Initialize session state keys if not present
+
+    # Initialize session state if necessary
     if 'balance' not in st.session_state:
         st.session_state['balance'] = 0.0
-    if 'last_check_time' not in st.session_state:
         st.session_state['last_check_time'] = 0.0
 
-    # Directive 5: Idempotency check ensures we don't spam the external API
-    if current_time - st.session_state['last_check_time'] >= REFRESH_INTERVAL:
+    # Directive 5: Idempotency check prevents API spam
+    if current_time - st.session_state['last_check_time'] >= refresh_interval:
+        logger.info({"event": "balance_check", "reason": "cache_expired", "interval": refresh_interval})
         try:
-            # Execute the core async function synchronously (required hack for Streamlit context)
-            balance = asyncio.run(async_get_balance(addr))
+            # Directive 3: Execute the async network call synchronously
+            balance = asyncio.run(async_get_balance(addr=addr, api_key=api_key))
             
-            # Update cache
+            # Idempotent write to cache
             st.session_state['balance'] = balance
             st.session_state['last_check_time'] = current_time
-            
-            # Check for unlock status and report idempotently to ZFP Mesh (Directive 1/5)
-            unlocked = balance >= THRESHOLD
-            asyncio.run(report_premium_status(unlocked, addr, balance)) 
-
+            logger.info({"event": "balance_update", "new_balance": balance})
             return balance
         except Exception as e:
-            logger.error({"event": "asyncio_run_failure", "detail": "Failed to run main async tasks.", "error": str(e)})
-            # Return cached value on failure
+            logger.error({"event": "asyncio_run_failure", "error": str(e), "message": "Failed to execute async balance check."})
+            # Resilience: Return cached value on critical internal failure
             return st.session_state['balance']
-    
-    # Return cached value if refresh interval has not passed
+
+    logger.debug({"event": "balance_cached", "balance": st.session_state['balance']})
     return st.session_state['balance']
 
-# --- Function to generate QR code as a Streamlit image (Directive 5: Type Hinting) ---
-def generate_qr_code(data: Union[str, bytes]) -> bytes:
-    """Generates QR code image data in PNG format."""
-    # Directive 2: Basic validation for input data
-    if not data or (isinstance(data, str) and not data.strip()):
-        logger.warning({"event": "qr_generation_failed", "reason": "empty_data"})
-        return b''
-        
-    data_str = data if isinstance(data, str) else data.decode('utf-8')
+# --- Function to generate QR code as a Streamlit image (Directive 5: Type Hinting, Directive 4: Portability) ---
+def generate_qr_code(data: str) -> Union[bytes, None]:
+    """Generates QR code PNG data in memory."""
+    # Directive 2 & 5: Validation and explicit return typing
+    if not isinstance(data, str) or not data:
+        logger.warning({"event": "validation_error", "type": "qr_data_empty"})
+        return None
 
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=8,
-        border=4,
-    )
-    qr.add_data(data_str)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="white", back_color="transparent").convert('RGBA')
+    try:
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_H, # Increased error correction for resilience
+            box_size=8,
+            border=4,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="white", back_color="transparent").convert('RGBA')
 
-    # Use BytesIO (in-memory I/O, non-blocking)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+        # Directive 4: Use in-memory buffer (BytesIO) for portability
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        logger.error({"event": "qr_generation_failure", "data_length": len(data), "error": str(e)})
+        return None
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(
-    page_title="OraculumX • AI Crypto Signals",
+    page_title="OraculumX • ZFP Mesh Signals",
     page_icon="🔮",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 # --- Custom CSS for Styling ---
+# (CSS remains largely the same, ensuring compatibility with containerized environment)
 st.markdown(
     """
     <style>
     /* General Streamlit container styling */
     .stApp {
-        background-color: #1a1a2e; /* Dark blue/purple background */
-        color: #e0e0e0; /* Light gray text */
+        background-color: #1a1a2e;
+        color: #e0e0e0;
         font-family: 'Arial', sans-serif;
     }
 
     /* Header styling */
     h1, h2, h3, h4, h5, h6 {
-        color: #e94560; /* Vibrant red/pink for headers */
+        color: #e94560;
         margin-top: 1.5em;
         margin-bottom: 0.8em;
     }
@@ -208,13 +192,13 @@ st.markdown(
         text-shadow: 2px 2px 5px rgba(0,0,0,0.5);
     }
     h2 {
-        color: #00bcd4; /* Cyan for subheaders */
+        color: #00bcd4;
     }
 
     /* Metric styling */
     div[data-testid="stMetricValue"] {
         font-size: 2.5em;
-        color: #f0a500; /* Orange/gold for metrics */
+        color: #f0a500;
         font-weight: bold;
     }
     div[data-testid="stMetricLabel"] {
@@ -223,12 +207,12 @@ st.markdown(
     }
     div[data-testid="stMetricDelta"] {
         font-size: 0.9em;
-        color: #28B463; /* Green for positive delta */
+        color: #28B463;
     }
 
     /* Buttons styling */
     .stButton button {
-        background-color: #533483; /* Dark purple */
+        background-color: #533483;
         color: white;
         padding: 10px 20px;
         border: none;
@@ -237,11 +221,11 @@ st.markdown(
         font-size: 16px;
         font-weight: bold;
         transition: background-color 0.3s ease, transform 0.2s ease;
-        margin: 5px; /* Add some margin around buttons */
+        margin: 5px;
         box-shadow: 3px 3px 8px rgba(0,0,0,0.4);
     }
     .stButton button:hover {
-        background-color: #3e286e; /* Darker purple on hover */
+        background-color: #3e286e;
         transform: scale(1.02);
     }
     .stButton button:active {
@@ -250,8 +234,8 @@ st.markdown(
 
     /* Style for the "Buy Me a Coffee" button specifically */
     .buy-me-a-coffee-button button {
-        background-color: #FFDD00; /* Yellow for Ko-fi/BMC */
-        color: #614B2A; /* Dark brown text */
+        background-color: #FFDD00;
+        color: #614B2A;
         border: 2px solid #614B2A;
         box-shadow: 3px 3px 8px rgba(0,0,0,0.4);
     }
@@ -269,18 +253,18 @@ st.markdown(
     .section-header {
         font-size: 1.8em;
         font-weight: bold;
-        color: #e94560; /* Vibrant red/pink */
+        color: #e94560;
         margin-top: 20px;
         margin-bottom: 15px;
         text-align: center;
     }
     .crypto-address {
-        background-color: #2a2a4a; /* Darker background for code */
+        background-color: #2a2a4a;
         padding: 8px;
         border-radius: 5px;
         font-family: monospace;
-        word-break: break-all; /* Ensure long addresses wrap */
-        white-space: pre-wrap; /* Preserve whitespace and wrap */
+        word-break: break-all;
+        white-space: pre-wrap;
         font-size: 0.9em;
         color: #f0f0f0;
         border: 1px solid #3a3a5a;
@@ -306,10 +290,10 @@ st.markdown(
 )
 
 # --- Main App Content ---
-st.title("🔮 OraculumX – Future Signals from Beyond the Chain")
+st.title("🔮 OraculumX – ZFP Mesh Signals")
 st.markdown("""
-Welcome to **OraculumX**, your gateway to cutting-edge AI-driven crypto signals.
-Our advanced algorithms analyze market trends to provide you with insights, helping you navigate the volatile crypto landscape.
+Welcome to **OraculumX**, your gateway to cutting-edge AI-driven crypto signals routed through the ZFP Mesh Neuro Kernel.
+Our advanced, resilient algorithms analyze market trends to provide you with insights, helping you navigate the volatile crypto landscape.
 """)
 
 st.divider()
@@ -330,17 +314,20 @@ st.divider()
 # Tipping/Donation Panel
 st.markdown('<p class="section-header">💎 Unlock Premium Signals & Support OraculumX</p>', unsafe_allow_html=True)
 st.markdown(f"""
-Your support helps us keep the lights on and continue developing advanced AI models.
-**Send $\\geq$ `{THRESHOLD:.4f}` ETH to the address below to instantly unlock our Premium Alpha signals!**
+Your support helps us maintain the Neuro Kernel infrastructure.
+**Send $\\geq$ `{THRESHOLD}` ETH to the address below to instantly unlock our Premium Alpha signals!**
 """)
 
 col_eth_qr, col_eth_details = st.columns([1, 2])
 
+# Generate QR code safely
+qr_data = generate_qr_code(ETH_ADDR)
 with col_eth_qr:
-    if ETH_ADDR.startswith('0x') and len(ETH_ADDR) == 42:
-        st.image(generate_qr_code(ETH_ADDR), width=200, caption="Scan ETH for Premium Unlock")
+    if qr_data:
+        # st.image handles bytes data directly if format is specified
+        st.image(qr_data, width=200, caption="Scan ETH for Premium Unlock", use_column_width=False, output_format="PNG")
     else:
-        st.warning("ETH Address configuration incomplete or invalid. Please check ZFP_ETH_ADDR.")
+        st.warning("ETH Address configuration or QR generation failed.")
 
 
 with col_eth_details:
@@ -356,7 +343,8 @@ with col_eth_details:
     """)
 
 # Check on-chain balance to unlock premium (Using async wrapper with rate limiting)
-latest = get_balance_sync(ETH_ADDR)
+# Directive 2, 5: Pass required configuration variables
+latest = get_balance_sync(addr=ETH_ADDR, api_key=API_KEY, refresh_interval=REFRESH_INTERVAL)
 unlocked = latest >= THRESHOLD
 status = f"✅ Premium Unlocked! Balance: {latest:.6f} ETH" if unlocked else f"🔒 Tip to Unlock Premium Signals (Current Balance: {latest:.6f} ETH)"
 st.info(status)
@@ -394,11 +382,10 @@ with col_bmc:
     st.markdown("""
     A quick and easy way to show your appreciation!
     """)
-    # Directive 5: Ensure external link is handled safely
     st.markdown(
         f"""
         <div class="buy-me-a-coffee-button">
-            <a href="https://coff.ee/xenotech" target="_blank" rel="noopener noreferrer" style="text-decoration: none;">
+            <a href="https://coff.ee/xenotech" target="_blank" style="text-decoration: none;">
                 <button>
                     Buy Me a Coffee! ☕
                 </button>
@@ -429,26 +416,29 @@ col_btc, col_sol = st.columns(2)
 
 with col_btc:
     with st.expander("Bitcoin (BTC)"):
-        if BTC_ADDR and BTC_ADDR != "bc1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxdead":
-            st.image(generate_qr_code(BTC_ADDR), width=150, caption="Scan BTC QR")
+        btc_qr_data = generate_qr_code(BTC_ADDR)
+        if btc_qr_data and BTC_ADDR.startswith('bc1'):
+            st.image(btc_qr_data, width=150, caption="Scan BTC QR", output_format="PNG")
             st.markdown(f'<div class="crypto-address">{BTC_ADDR}</div>', unsafe_allow_html=True)
             if st.button("Copy BTC Address", key="copy_btc_other"):
                 st.code(BTC_ADDR, language="text")
                 st.success("BTC address copied to clipboard (see code block above)!")
         else:
-            st.warning("BTC Address not configured via environment variable.")
+            st.warning("BTC Address not configured or QR generation failed.")
 
 with col_sol:
     with st.expander("Phantom/Solana (SOL)"):
-        if SOL_ADDR and 'DEAD' not in SOL_ADDR:
-            st.image(generate_qr_code(SOL_ADDR), width=150, caption="Scan SOL QR")
+        sol_qr_data = generate_qr_code(SOL_ADDR)
+        # Check if SOL_ADDR is configured (not the placeholder)
+        if sol_qr_data and len(SOL_ADDR) > 30 and 'DEAD' not in SOL_ADDR:
+            st.image(sol_qr_data, width=150, caption="Scan SOL QR", output_format="PNG")
             st.markdown(f'<div class="crypto-address">{SOL_ADDR}</div>', unsafe_allow_html=True)
             if st.button("Copy SOL Address", key="copy_sol_other"):
                 st.code(SOL_ADDR, language="text")
                 st.success("SOL address copied to clipboard (see code block above)!")
         else:
-            st.warning("SOL Address not configured via environment variable.")
+            st.warning("SOL Address not configured or QR generation failed.")
 
 st.markdown("---")
-st.markdown("Thank you for being a part of the OraculumX journey!")
+st.markdown("Thank you for being a part of the OraculumX journey, powered by the ZFP Neuro Kernel!")
 ### ZFP_CODEX_END_V1.0 ###
